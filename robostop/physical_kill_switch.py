@@ -172,6 +172,10 @@ class PhysicalKillSwitch(Node):
             if(self.iskilled()):
                 self.state = PhysicalKillState.ROBOT_KILLED
 
+            # handle case where code dies
+            if(not self.checkAlive()):
+               self.state = PhysicalKillState.ROBOT_NOT_PRESENT
+
         elif(self.state == PhysicalKillState.KILL_NOT_REQ):
             self.killLedState = KillLedMode.BLINK_RED_GREEN
             self.killReport.switch_needs_update = False
@@ -195,7 +199,11 @@ class PhysicalKillSwitch(Node):
             # since we are not the only kill, make sure the robot is alive
             if(self.iskilled()):
                 self.state = PhysicalKillState.ROBOT_KILLED
-        
+
+            # handle robot code death gracefully
+            if(self.checkAlive()):
+                self.state = PhysicalKillState.ROBOT_NOT_PRESENT
+
         elif(self.state == PhysicalKillState.ROBOT_KILL_SENT):
             self.killLedState = KillLedMode.SOLID_YELLOW
             self.killReport.switch_asserting_kill = True
@@ -219,7 +227,9 @@ class PhysicalKillSwitch(Node):
             if(not self.iskilled() and not self.lastKillState and self.switchDebounce):
                 self.get_logger().warning('Kill switch cleared! robot re-enabled!')
                 self.state = PhysicalKillState.ROBOT_ALIVE
-
+            # handle when robot code goes down while disabled
+            if(self.checkAlive()):
+                self.state = PhysicalKillState.ROBOT_NOT_PRESENT
         # this is very very bad
         elif(self.state == PhysicalKillState.ROBOT_KILL_NACK):
             self.killLedState = KillLedMode.BLINK_YELLOW
@@ -331,16 +341,13 @@ class PhysicalKillSwitch(Node):
         timeout = self.lastFirmState.kill_switches_timed_out
 
         isAsserted = asserted & index
-        isTimeout = timeout & index 
+        isTimeout = timeout & index
 
         # self.get_logger().info(f'killassert index {index} assert: {asserted}, timeout: {timeout}, killed:{isAsserted}, timedout:{isTimeout}')
 
         return isAsserted > 0 or isTimeout > 0
 
     def iskilled(self):
-        def xor(a, b):
-            return (a and not b) or (not a and b)
-
         # this is a conversion because bitwise not in python is stupid...
         index = int(ctypes.c_uint32(~4).value)
         asserted = self.lastFirmState.kill_switches_asserting_kill
