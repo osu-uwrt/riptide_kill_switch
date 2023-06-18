@@ -9,12 +9,12 @@ def generate_launch_description():
     # Read in the vehicle's namespace through the command line or use the default value one is not provide
     return launch.LaunchDescription([
         launch.actions.DeclareLaunchArgument(
-            "robot", 
-            default_value="tempest",
+            "robot",
+            default_value="talos",
             description="Name of the vehicle",
         ),
 
-        # create the nodes    
+        # create the nodes
         launch_ros.actions.Node(
             package='robostop',
             executable='physical_kill_switch',

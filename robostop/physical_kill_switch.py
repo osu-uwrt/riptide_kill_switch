@@ -1,71 +1,152 @@
+import os
+import time
 import rclpy
+import threading
 from rclpy.node import Node
-from rclpy.time import Time, Duration
 from rclpy.qos import qos_profile_sensor_data, qos_profile_system_default
 
-from riptide_msgs2.msg import KillSwitchReport, FirmwareState
-from std_msgs.msg import UInt8
+from std_msgs.msg import Bool
+from riptide_msgs2.msg import KillSwitchReport, FirmwareStatus
 
-import ctypes
+from riptide_hardware2.common import ExpiringMessage, Mk2Board
 
 from enum import Enum
 import gpiod
 
+# Physical Kill
 RED_PIN = 21
 GREEN_PIN = 26
 YELLOW_PIN = 20
 KILL_SWITCH_PIN = 19
 REPORT_REQ_PIN = 16
-sensePin = 10
+# SENSE_PIN = 10  # This pin didn't end up getting routed on the current kill switch
 
-GREEN_INIT_HOLD = 40
-NACK_TIMEOUT = Duration(nanoseconds= 5 * 10e7)
-RE_INIT_TIMEOUT = Duration(seconds=10)
+# Stack Light
+STACK_RED = 18
+STACK_GREEN = 24
+STACK_YELLOW = 23
+STACK_BUZZER = 25
 
-REQUIRED_NODES = [
-    'physical_kill_switch',
-    'coprocessor_node'
-]
+# Timeouts
+FIRMWARE_MESSAGE_TIMEOUT_SEC = 2.0
+NACK_TIMEOUT_SEC = 2.0
 
-class KillLedMode(Enum):
-    ALL_OFF = 0
-    ALL_SOLID = 1
-    CHASE_MODE = 2
-    SOLID_RED = 3
-    BLINK_RED = 4
-    SOLID_YELLOW = 5
-    BLINK_YELLOW = 6
-    SOLID_GREEN = 7
-    BLINK_GREEN = 8
-    BLINK_RED_GREEN = 9
-    BLINK_ALL = 10
+class DebouncedInput:
+    debounceTimeSeconds = 0.5
 
-class PhysicalKillState(Enum):
-    INIT = 0
-    ROBOT_NOT_PRESENT = 1
-    ROBOT_ALIVE = 2
-    ROBOT_KILL_SENT = 3
-    ROBOT_KILL_NACK = 4
-    ROBOT_KILLED = 5
-    KILL_NOT_REQ = 6
+    def __init__(self, input: 'gpiod.line', preferred_value: bool):
+        assert type(preferred_value) == bool, "Preferred value must be bool"
+
+        self.input = input
+        self.preferredValue = preferred_value
+        self.lastChangeTime = time.time()
+        self.lastValue = bool(input.get_value())
+
+    def getState(self) -> bool:
+        """Gets the current debounced state of the GPIO line.
+        Note this must be called frequently enough to ensure debounce logic functions as expected.
+        """
+        value = bool(self.input.get_value())
+        if value != self.lastValue:
+            self.lastChangeTime = time.time()
+        self.lastValue = value
+
+        if time.time() - self.lastChangeTime < self.debounceTimeSeconds:
+            return self.preferredValue
+        else:
+            return value
 
 
+class ACKState(Enum):
+    STATE_OKAY = 0
+    STATE_WAITING = 1
+    STATE_NACK = 2
 
-class PhysicalKillSwitch(Node):
+
+class LEDMode(Enum):
+    def __new__(cls, red_en: bool, yellow_en: bool, green_en: bool, mode_blink: bool, mode_chase: bool) -> 'LEDMode':
+        assert not (mode_blink and mode_chase), "Mode cannot be both blink and chase"
+        obj = object.__new__(cls)
+        obj._value_ = ((int(red_en) << 0) | (int(yellow_en) << 1) | (int(green_en) << 2) |
+                        (int(mode_blink) << 3) | (int(mode_chase) << 4))
+        obj._red_en_ = red_en
+        obj._yellow_en_ = yellow_en
+        obj._green_en_ = green_en
+        obj._mode_blink_ = mode_blink
+        obj._mode_chase_ = mode_chase
+        obj._chase_sequence_ = []
+        if red_en:
+            obj._chase_sequence_.append((True, False, False))
+        if yellow_en:
+            obj._chase_sequence_.append((False, True, False))
+        if green_en:
+            obj._chase_sequence_.append((False, False, True))
+        assert not (mode_chase and len(obj._chase_sequence_) == 0), "Chase requires at least one mode"
+
+        return obj
+
+    @property
+    def red_en(self) -> bool:
+        return self._red_en_
+
+    @property
+    def yellow_en(self) -> bool:
+        return self._yellow_en_
+
+    @property
+    def green_en(self) -> bool:
+        return self._green_en_
+
+    @property
+    def mode_blink(self) -> bool:
+        return self._mode_blink_
+
+    @property
+    def mode_chase(self) -> bool:
+        return self._mode_chase_
+
+    @property
+    def chase_sequence(self) -> list[tuple[bool]]:
+        return self._chase_sequence_
+
+    def computeColors(self) -> tuple[bool]:
+        if self.mode_chase:
+            seq_len = len(self.chase_sequence)
+            seq_id = int(time.time()) % seq_len
+            return self.chase_sequence[seq_id]
+        else:
+            if int(time.time()) % 2 or not self.mode_blink:
+                return (self.red_en, self.yellow_en, self.green_en)
+            else:
+                return (False, False, False)
+
+    # Format: ed_en, yellow_en, green_en, mode_blink, mode_chase
+    ALL_OFF = False, False, False, False, False
+    ALL_SOLID = True, True, True, False, False
+    CHASE_MODE = True, True, True, False, True
+    SOLID_RED = True, False, False, False, False
+    BLINK_RED = True, False, False, True, False
+    SOLID_YELLOW = False, True, False, False, False
+    BLINK_YELLOW = False, True, False, True, False
+    SOLID_GREEN = False, False, True, False, False
+    BLINK_GREEN = False, False, True, True, False
+    BLINK_RED_GREEN = True, False, True, True, False
+    BLINK_ALL = True, True, True, True, False
+    CHASE_RED_GREEN = True, False, True, False, True
+    CHASE_YELLOW_GREEN = False, True, True, False, True
+
+
+class GPIOController:
+    gpioConsumer = 'physical_kill_switch'
+
     def __init__(self):
-        super().__init__('physical_kill_switch')
-
-        self.create_subscription(FirmwareState, 'state/firmware', self.firmware_state_callback, qos_profile_sensor_data)
-        self.reportPublisher = self.create_publisher(KillSwitchReport, 'control/software_kill', qos_profile_system_default)
-
-        self.killStatePub = self.create_publisher(UInt8, 'physical_kill_state', qos_profile_system_default)
-
-        self.refreshTimer = self.create_timer(0.05, self.refreshCallback)
-        self.blinkTimer = self.create_timer(0.5, self.blinkCallback)
-        self.printHoldTimer = self.create_timer(1.0, self.printCallback)
-
         # Grab the GPIO controller
-        self.gpioChip = gpiod.chip('pinctrl-bcm2711')
+        self.gpioChip = gpiod.chip('gpiochip0')
+
+        self.stackRed = self.gpioChip.get_line(STACK_RED)
+        self.stackYellow = self.gpioChip.get_line(STACK_YELLOW)
+        self.stackGreen = self.gpioChip.get_line(STACK_GREEN)
+        self.stackBuzzer = self.gpioChip.get_line(STACK_BUZZER)
 
         self.redLed = self.gpioChip.get_line(RED_PIN)
         self.yellowLed = self.gpioChip.get_line(YELLOW_PIN)
@@ -73,309 +154,355 @@ class PhysicalKillSwitch(Node):
 
         # Configure led pins
         ledCFG = gpiod.line_request()
-        ledCFG.consumer = 'physical_kill_switch'
+        ledCFG.consumer = self.gpioConsumer
         ledCFG.request_type=gpiod.line_request.DIRECTION_OUTPUT
         self.redLed.request(ledCFG)
         self.yellowLed.request(ledCFG)
         self.greenLed.request(ledCFG)
+        self.stackRed.request(ledCFG)
+        self.stackYellow.request(ledCFG)
+        self.stackGreen.request(ledCFG)
+        self.stackBuzzer.request(ledCFG)
 
         self.killSwitch = self.gpioChip.get_line(KILL_SWITCH_PIN)
         self.requireSwitch = self.gpioChip.get_line(REPORT_REQ_PIN)
+        # self.sensePin = self.gpioChip.get_line(SENSE_PIN)
 
         # Configure switch pins
         inputCFG = gpiod.line_request()
-        inputCFG.consumer = 'physical_kill_switch'
+        inputCFG.consumer = self.gpioConsumer
         inputCFG.request_type=gpiod.line_request.DIRECTION_INPUT
         inputCFG.flags = gpiod.line_request.FLAG_BIAS_PULL_UP
         self.killSwitch.request(inputCFG)
         self.requireSwitch.request(inputCFG)
+        # self.sensePin.request(inputCFG)
 
-        self.get_logger().info('Physical kill switch started')
+        # Create the debounced inputs
+        self.killSwitchDebounced = DebouncedInput(self.killSwitch, True)
+        self.requireSwitchDebounced = DebouncedInput(self.requireSwitch, True)
+        # self.sensePinDebounced = DebouncedInput(self.sensePin, True)
+        self.buzzerThread = None
 
-        self.state = PhysicalKillState.INIT
-        self.killLedState = KillLedMode.ALL_OFF
+    def applyKillswitchLeds(self, state: 'LEDMode'):
+        red, yellow, green = state.computeColors()
+        self.redLed.set_value(red)
+        self.yellowLed.set_value(yellow)
+        self.greenLed.set_value(green)
 
-        # internal vars for animating the LEDS and debouncing the buttons/ switches
-        self.ledToggle = False
-        self.switchDebounce = False
-        self.ledCount = 0
-        self.ledHold = 0
-        self.print = True
+    def applyStackLeds(self, state: 'LEDMode'):
+        red, yellow, green = state.computeColors()
+        self.stackRed.set_value(red)
+        self.stackYellow.set_value(yellow)
+        self.stackGreen.set_value(green)
 
-        # state information on switches and the last kill time
-        self.lastKillState = False
-        self.lastRequireState = False
-        self.killSentTime = self.get_clock().now()
+    def getKillswitchAssertingKill(self) -> bool:
+        return self.killSwitchDebounced.getState()
+
+    def getKillswitchRequiringUpdate(self) -> bool:
+        return self.requireSwitchDebounced.getState()
+
+    # def getKillswitchConnected(self) -> bool:
+    #     return not self.sensePinDebounced.getState()
+
+    def chirpBuzzer(self):
+        self._startBuzzerTask(self._chirpBuzzerTask)
+
+    def alertBuzzer(self):
+        self._startBuzzerTask(self._alertBuzzerTask)
+
+    def _startBuzzerTask(self, task):
+        if self.buzzerThread is not None:
+            if self.buzzerThread.is_alive():
+                return
+            self.buzzerThread.join()
+        self.buzzerThread = threading.Thread(target=task)
+        self.buzzerThread.start()
+
+    def _chirpBuzzerTask(self):
+        self.stackBuzzer.set_value(1)
+        time.sleep(0.01)
+        self.stackBuzzer.set_value(0)
+
+    def _alertBuzzerTask(self):
+        for _ in range(10):
+            self.stackBuzzer.set_value(1)
+            time.sleep(0.01)
+            self.stackBuzzer.set_value(0)
+            time.sleep(0.01)
+        self.stackBuzzer.set_value(0)
+        time.sleep(0.1)
+        self.stackBuzzer.set_value(1)
+        time.sleep(0.1)
+        self.stackBuzzer.set_value(0)
+
+    """
+    Here's a really cool buzzer pattern that sounds like the stack is going to explode. However it would probably be
+    unwise to add this into the code for obvious reasons. But if you're messing around with the stack you can try it:
+
+        for _ in range(5):
+            gpioController.stackBuzzer.set_value(1)
+            time.sleep(0.5)
+            for _ in range(30):
+                gpioController.stackBuzzer.set_value(1)
+                time.sleep(0.01)
+                gpioController.stackBuzzer.set_value(0)
+                time.sleep(0.01)
+    """
+
+    def releaseGpio(self):
+        self.buzzerThread.join()
+        # Release LEDS
+        self.redLed.set_value(0)
+        self.redLed.release()
+        self.yellowLed.set_value(0)
+        self.yellowLed.release()
+        self.greenLed.set_value(0)
+        self.greenLed.release()
+
+        # Release stack light
+        self.stackRed.set_value(0)
+        self.stackRed.release()
+        self.stackYellow.set_value(0)
+        self.stackYellow.release()
+        self.stackGreen.set_value(0)
+        self.stackGreen.release()
+        self.stackBuzzer.set_value(0)
+        self.stackBuzzer.release()
+
+        # Release inputs
+        self.requireSwitch.release()
+        self.killSwitch.release()
+        # self.sensePin.release()
+
+
+class KillSwitchSelfcheck:
+    def __init__(self, logger):
+        self.logger = logger
+        self.reset()
+
+    def reset(self):
+        self.logger.info("Topside Switch Self Check - Toggle both required and assert into killed/require update position")
+        self.assertSeenLow = False
+        self.assertSeenHigh = False
+        self.requiredSeenLow = False
+        self.requiredSeenHigh = False
+
+    def isReady(self) -> bool:
+        return self.assertSeenLow and self.assertSeenHigh and self.requiredSeenLow and self.requiredSeenHigh
+
+    def checkPoll(self, physkillRequired: bool, physkillAssertingKill: bool, change_cb) -> 'LEDMode':
+        if not self.assertSeenLow and not physkillAssertingKill:
+            self.assertSeenLow = True
+            if change_cb:
+                change_cb()
+        elif self.assertSeenLow and not self.assertSeenHigh and physkillAssertingKill:
+            self.assertSeenHigh = True
+            if change_cb:
+                change_cb()
+        elif not self.requiredSeenLow and not physkillRequired:
+            self.requiredSeenLow = True
+            if change_cb:
+                change_cb()
+        elif self.requiredSeenLow and not self.requiredSeenHigh and physkillRequired:
+            self.requiredSeenHigh = True
+            if change_cb:
+                change_cb()
+
+        # TODO: This should ideally check if its plugged in so it doesn't accidentally selfcheck on insertion and removal
+        if self.requiredSeenHigh and self.assertSeenHigh:
+            return LEDMode.ALL_SOLID
+        elif self.requiredSeenHigh and not self.assertSeenHigh:
+            return LEDMode.CHASE_RED_GREEN
+        elif self.assertSeenHigh and not self.requiredSeenHigh:
+            return LEDMode.CHASE_YELLOW_GREEN
+        else:
+            return LEDMode.CHASE_MODE
+
+
+class TopsideKillSwitch(Node):
+    authorityBoard = Mk2Board.POWER_BOARD
+    firmwareStatusTimeout = 2.0
+
+    def __init__(self, gpioController: 'GPIOController'):
+        super().__init__('topside_kill_switch')
+        self.get_logger().info('Topside kill switch started')
+
+        self.gpioController = gpioController
+        self.switchSelfcheck = KillSwitchSelfcheck(self.get_logger())
+
+        self.create_subscription(FirmwareStatus, 'state/firmware', self.firmware_state_callback, qos_profile_sensor_data)
+        self.create_subscription(Bool, 'state/kill', self.kill_state_callback, qos_profile_sensor_data)
+        self.create_subscription(Bool, 'state/thrusters/moving_brd0', self.moving_brd0_callback, qos_profile_sensor_data)
+        self.create_subscription(Bool, 'state/thrusters/moving_brd1', self.moving_brd1_callback, qos_profile_sensor_data)
+        self.reportPublisher = self.create_publisher(KillSwitchReport, 'command/software_kill', qos_profile_system_default)
+
+        self.refreshTimer = self.create_timer(0.15, self.refreshCallback)
+
+        # Set last time killswitch matched to current time
+        # In case the robot is already up when we come up, make sure we give time for state to stabalize
+        self.lastMatchTime = time.time()
+        self.ackState = ACKState.STATE_OKAY
 
         # last recieved or sent messages
-        self.killReport = KillSwitchReport(sender_id='physical_kill_switch', kill_switch_id=KillSwitchReport.KILL_SWITCH_TOPSIDE_BUTTON)
-        self.lastFirmState = FirmwareState()
+        self.killReport = KillSwitchReport(sender_id='topside_kill_' + os.urandom(3).hex(), kill_switch_id=KillSwitchReport.KILL_SWITCH_TOPSIDE_BUTTON)
+        self.firmwareStatus = ExpiringMessage(self.get_clock(), self.firmwareStatusTimeout)
+        self.movingBrd0Message = ExpiringMessage(self.get_clock(), self.firmwareStatusTimeout)
+        self.movingBrd1Message = ExpiringMessage(self.get_clock(), self.firmwareStatusTimeout)
+        self.globalKillMessage = ExpiringMessage(self.get_clock(), self.firmwareStatusTimeout)
 
-    def firmware_state_callback(self, msg: FirmwareState):
-        self.lastFirmState = msg
-    
+    def firmware_state_callback(self, msg: FirmwareStatus):
+        if msg.client_id != self.authorityBoard.client_id or msg.bus_id != self.authorityBoard.bus_id:
+            return
+
+        self.firmwareStatus.update_value(msg)
+
+    def moving_brd0_callback(self, msg: Bool):
+        self.movingBrd0Message.update_value(msg.data)
+
+    def moving_brd1_callback(self, msg: Bool):
+        self.movingBrd1Message.update_value(msg.data)
+
+    def kill_state_callback(self, msg: Bool):
+        self.globalKillMessage.update_value(msg.data)
+
     def refreshCallback(self):
-        self.lastKillState = bool(self.killSwitch.get_value())
-        self.lastRequireState = bool(self.requireSwitch.get_value())
+        self.refreshStackLight()
+        self.refreshKillSwitch()
 
-        if(self.state == PhysicalKillState.INIT):
-            self.ledHold = 0 if self.ledHold < 0 else self.ledHold - 1
-            # When kill pressed change to green
-            if(self.killLedState == KillLedMode.BLINK_YELLOW and self.lastKillState and self.switchDebounce):
-                self.switchDebounce = False
-                self.killLedState = KillLedMode.SOLID_GREEN
-                self.ledHold = GREEN_INIT_HOLD
-                self.get_logger().info('Checking online nodes')
+    def refreshStackLight(self):
+        if not self.checkAlive():
+            stackLedState = LEDMode.ALL_OFF
+        else:
+            if self.checkMoving():
+                stackLedState = LEDMode.SOLID_GREEN
+            elif self.checkUnkilled():
+                stackLedState = LEDMode.SOLID_YELLOW
+            else:
+                stackLedState = LEDMode.SOLID_RED
 
-            # When require disabled change to yellow
-            elif(self.killLedState == KillLedMode.BLINK_ALL and not self.lastRequireState and self.switchDebounce):
-                self.switchDebounce = False
-                self.killLedState = KillLedMode.BLINK_YELLOW
-                self.get_logger().warning('Press and release kill button to proceed with initialization')
-            
-            # Show all blinking by default
-            elif(self.killLedState == KillLedMode.ALL_OFF):
-                self.killLedState = KillLedMode.BLINK_ALL
-                self.get_logger().warning('Toggle requirement switch to proceed with initialization')
-            
-            # when green we have tested the remote and we can exit init to robot not present
-            elif(self.killLedState == KillLedMode.SOLID_GREEN and self.ledHold == 0):
-                self.switchDebounce = False
-                self.state = PhysicalKillState.ROBOT_NOT_PRESENT
+        self.gpioController.applyStackLeds(stackLedState)
 
-        elif(self.state == PhysicalKillState.ROBOT_NOT_PRESENT):
-            self.killLedState = KillLedMode.BLINK_RED
-            self.killReport.switch_needs_update = False
-            self.killReport.switch_asserting_kill = True
+    def refreshKillSwitch(self):
+        physkillAssertingKill = self.gpioController.getKillswitchAssertingKill()
+        physkillRequired = self.gpioController.getKillswitchRequiringUpdate()
 
-            # check rosnode list to see if copro and controller are up
-            if(self.checkAlive()):
-                self.get_logger().warning('All required nodes online. Physical kill switch ready!')
-                self.state = PhysicalKillState.ROBOT_ALIVE
+        if not self.switchSelfcheck.isReady():
+            self.gpioController.applyKillswitchLeds(self.switchSelfcheck.checkPoll(physkillRequired, physkillAssertingKill, self.gpioController.chirpBuzzer))
 
-        elif(self.state == PhysicalKillState.ROBOT_ALIVE):
-            self.killLedState = KillLedMode.SOLID_GREEN
-            self.killReport.switch_needs_update = True
-            self.killReport.switch_asserting_kill = False
+            # Don't do anything else if the switch isn't initialized
+            return
 
-            # if the requirement is disabled goto requirement disabled state
-            if(not self.lastRequireState):
-                self.state = PhysicalKillState.KILL_NOT_REQ
 
-            # handle kill pressed
-            if(self.lastKillState):
-                self.state = PhysicalKillState.ROBOT_KILL_SENT
-                self.killSentTime = self.get_clock().now()
-                self.switchDebounce = False
+        # Compute our kill report message and light state
+        # Note these will be overridden below if the global state doesn't match
+        self.killReport.switch_needs_update = physkillRequired
+        self.killReport.switch_asserting_kill = physkillAssertingKill
+        if physkillAssertingKill:
+            killLedState = LEDMode.SOLID_RED
+        elif not physkillRequired:
+            killLedState = LEDMode.BLINK_RED_GREEN
+        else:
+            killLedState = LEDMode.SOLID_GREEN
 
-            # since we are not the only kill, make sure the robot is alive
-            if(self.iskilled()):
-                self.state = PhysicalKillState.ROBOT_KILLED
 
-            # handle case where code dies
-            if(not self.checkAlive()):
-               self.state = PhysicalKillState.ROBOT_NOT_PRESENT
+        # Handle robot state now and adjust our status accordingly
+        if not self.checkAlive():
+            if self.ackState == ACKState.STATE_WAITING:
+                self.gpioController.alertBuzzer()
 
-        elif(self.state == PhysicalKillState.KILL_NOT_REQ):
-            self.killLedState = KillLedMode.BLINK_RED_GREEN
-            self.killReport.switch_needs_update = False
-            self.killReport.switch_asserting_kill = False
+            # Robot not online (or at least firmware isn't) if these aren't present
+            killLedState = LEDMode.BLINK_RED
 
-            if(self.print):
-                self.get_logger().warning('Kill switch heartbeat not required!')
-                self.print = False
+            # Mark us as okay since we lost connection, and won't be able to wait for an ACK to come in
+            # Also prevents timeout as soon as it reconnects
+            self.lastMatchTime = time.time()
+            self.ackState = ACKState.STATE_OKAY
+        else:
+            if not self.isTopsideKillAssertedMatching(physkillAssertingKill) or \
+                    not self.isTopsideRequiringMatching(physkillRequired):
+                # Set LED to yellow to show the state isn't reflected yet
+                killLedState = LEDMode.SOLID_YELLOW
+                if time.time() - self.lastMatchTime > NACK_TIMEOUT_SEC:
+                    # If we haven't chirped yet to alert of the NACK, do so now
+                    if self.ackState == ACKState.STATE_WAITING:
+                        self.gpioController.alertBuzzer()
 
-            # if require has been re-enabled turn it back on
-            if(self.lastRequireState):
-                self.get_logger().warning('Requiring kill switch heartbeat enabled!')
-                self.state = PhysicalKillState.ROBOT_ALIVE
+                    # Set our state
+                    killLedState = LEDMode.BLINK_YELLOW
+                    self.ackState = ACKState.STATE_NACK
+                else:
+                    # Set waiting state so it'll chirp if we also loose connection
+                    self.ackState = ACKState.STATE_WAITING
+            else:
+                self.lastMatchTime = time.time()
+                self.ackState = ACKState.STATE_OKAY
 
-            # handle kill pressed
-            if(self.lastKillState):
-                self.state = PhysicalKillState.ROBOT_KILL_SENT
-                self.killSentTime = self.get_clock().now()
-                self.switchDebounce = False
-
-            # since we are not the only kill, make sure the robot is alive
-            if(self.iskilled()):
-                self.state = PhysicalKillState.ROBOT_KILLED
-
-            # handle robot code death gracefully
-            if(self.checkAlive()):
-                self.state = PhysicalKillState.ROBOT_NOT_PRESENT
-
-        elif(self.state == PhysicalKillState.ROBOT_KILL_SENT):
-            self.killLedState = KillLedMode.SOLID_YELLOW
-            self.killReport.switch_asserting_kill = True
-
-            # when robot acks head to killed state
-            if(self.iskillAsserted()):
-                self.state = PhysicalKillState.ROBOT_KILLED
-
-            elif(self.get_clock().now() - self.killSentTime > NACK_TIMEOUT):
-                self.get_logger().error(f'Robot did not acknowldge kill within {NACK_TIMEOUT}')
-                self.state = PhysicalKillState.ROBOT_KILL_NACK
-
-        elif(self.state == PhysicalKillState.ROBOT_KILLED):
-            if(self.print):
-                self.get_logger().error('Robot killed')
-                self.print = False
-
-            self.killLedState = KillLedMode.SOLID_RED
-
-            # we can now go back to un killed
-            if(not self.iskilled() and not self.lastKillState and self.switchDebounce):
-                self.get_logger().warning('Kill switch cleared! robot re-enabled!')
-                self.state = PhysicalKillState.ROBOT_ALIVE
-            # handle when robot code goes down while disabled
-            if(self.checkAlive()):
-                self.state = PhysicalKillState.ROBOT_NOT_PRESENT
-        # this is very very bad
-        elif(self.state == PhysicalKillState.ROBOT_KILL_NACK):
-            self.killLedState = KillLedMode.BLINK_YELLOW
-
-            # when robot acks head to killed state
-            if(self.iskillAsserted()):
-                self.state = PhysicalKillState.ROBOT_KILLED
-
-            # the robot might have gone down, go back to no robot
-            elif(self.get_clock().now() - self.killSentTime > RE_INIT_TIMEOUT):
-                self.get_logger().error('Waiting for robot to acknowledge kill timed out. Kill switch re-setting to robot dead')
-                self.state = PhysicalKillState.ROBOT_NOT_PRESENT
-
-        # Handle led modes
-        self.animateKillLeds()
-
-        # publish state debug info
-        stateMsg = UInt8(data=self.state.value)
-        self.killStatePub.publish(stateMsg)
+        # Set the LEDs
+        self.gpioController.applyKillswitchLeds(killLedState)
 
         # publish the kill switch report
         self.reportPublisher.publish(self.killReport)
 
-    def blinkCallback(self):
-        self.ledToggle = True
-        self.switchDebounce = True
-
-    def printCallback(self):
-        self.print = True
-
-    def animateKillLeds(self):
-        if(self.killLedState == KillLedMode.ALL_OFF):
-            self.applyLeds([0, 0, 0], False)
-
-        elif(self.killLedState == KillLedMode.ALL_SOLID):
-            self.applyLeds([1, 1, 1], False)
-
-        elif(self.killLedState == KillLedMode.BLINK_ALL):
-            self.applyLeds([self.ledCount % 2, self.ledCount % 2, self.ledCount % 2], True)
-
-        elif(self.killLedState == KillLedMode.CHASE_MODE):
-            self.applyLeds([int(self.ledCount == 1), int(self.ledCount == 2), int(self.ledCount == 3)], True)
-
-        elif(self.killLedState == KillLedMode.BLINK_RED_GREEN):
-            self.applyLeds([self.ledCount % 2, 0, self.ledCount % 2], True)
-
-        elif(self.killLedState == KillLedMode.SOLID_GREEN):
-            self.applyLeds([0, 0, 1], False)
-
-        elif(self.killLedState == KillLedMode.BLINK_GREEN):
-            self.applyLeds([0, 0, self.ledCount % 2], True)
-
-        if(self.killLedState == KillLedMode.SOLID_YELLOW):
-            self.applyLeds([0, 1, 0], False)
-
-        if(self.killLedState == KillLedMode.BLINK_YELLOW):
-            self.applyLeds([0, self.ledCount % 2, 0], True)
-
-        if(self.killLedState == KillLedMode.SOLID_RED):
-            self.applyLeds([1, 0, 0], False)
-
-        if(self.killLedState == KillLedMode.BLINK_RED):
-            self.applyLeds([self.ledCount % 2, 0, 0], True)                
-
-    def applyLeds(self, values, isBlink: bool):
-        if(len(values) != 3):
-            self.get_logger().error(f'Applied led animation with incorrect length {len(values)}')
-            return
-
-        if(isBlink and self.ledToggle):
-            self.ledCount = 0 if self.ledCount > 2 else self.ledCount + 1 # count zero through three
-            self.ledToggle = False
-
-            self.redLed.set_value(values[0])
-            self.yellowLed.set_value(values[1])
-            self.greenLed.set_value(values[2])
-
-        if(not isBlink):
-            self.redLed.set_value(values[0])
-            self.yellowLed.set_value(values[1])
-            self.greenLed.set_value(values[2])
-
-    def releaseGpio(self):
-        # Release LEDS
-        self.redLed.release()
-        self.yellowLed.release()
-        self.greenLed.release()
-
-        # Release switches
-        self.requireSwitch.release()
-        self.killSwitch.release()
-
     def checkAlive(self):
-        nodes = self.get_node_names()
-        for name in REQUIRED_NODES:
-            if(not name in nodes):
-                if(self.print):
-                    self.get_logger().warning(f'Could not find node \'{name}\' in {nodes}')
-                    self.print = False
+        firmwareMsg = self.firmwareStatus.get_value()
+        killMsg = self.globalKillMessage.get_value()
+        movingBrd0 = self.movingBrd0Message.get_value()
+        movingBrd1 = self.movingBrd1Message.get_value()
+        return firmwareMsg is not None and killMsg is not None and movingBrd0 is not None and movingBrd1 is not None
 
-                return False
+    def checkMoving(self):
+        movingBrd0 = self.movingBrd0Message.get_value()
+        movingBrd1 = self.movingBrd1Message.get_value()
+        return bool(movingBrd0 or movingBrd1)
 
-        return True
+    def checkUnkilled(self):
+        globalKillAsserting = self.globalKillMessage.get_value()
+        if globalKillAsserting is None:
+            return False
 
-    def iskillAsserted(self):
-        # this is a conversion because bitwise not in python is stupid...
-        index = int(ctypes.c_uint32(4).value)
-        asserted = self.lastFirmState.kill_switches_asserting_kill
-        timeout = self.lastFirmState.kill_switches_timed_out
+        return bool(not globalKillAsserting)
 
-        isAsserted = asserted & index
-        isTimeout = timeout & index
+    def isTopsideRequiringMatching(self, requestedRequiringUpdate: bool) -> bool:
+        msg: 'FirmwareStatus' = self.firmwareStatus.get_value()
+        if msg is None:
+            return False
 
-        # self.get_logger().info(f'killassert index {index} assert: {asserted}, timeout: {timeout}, killed:{isAsserted}, timedout:{isTimeout}')
+        id_mask = 1 << self.killReport.kill_switch_id
+        topside_enabled = bool(msg.kill_switches_enabled & id_mask)
+        topside_requiring_update = bool(msg.kill_switches_needs_update & id_mask)
 
-        return isAsserted > 0 or isTimeout > 0
+        return topside_enabled and (topside_requiring_update == requestedRequiringUpdate)
 
-    def iskilled(self):
-        # this is a conversion because bitwise not in python is stupid...
-        index = int(ctypes.c_uint32(~4).value)
-        asserted = self.lastFirmState.kill_switches_asserting_kill
-        timeout = self.lastFirmState.kill_switches_timed_out
+    def isTopsideKillAssertedMatching(self, requestedAssertingKill: bool) -> bool:
+        msg: 'FirmwareStatus' = self.firmwareStatus.get_value()
+        if msg is None:
+            return False
 
-        isAsserted = index & asserted
-        isTimeout = index & timeout
+        globalKillAsserting = self.globalKillMessage.get_value()
+        if globalKillAsserting is None:
+            return False
 
-        assertB = format(isAsserted, 'b')
-        timeoutB = format(isTimeout, 'b')
-        indexB = format(index, 'b')
+        id_mask = 1 << self.killReport.kill_switch_id
+        topside_enabled = bool(msg.kill_switches_enabled & id_mask)
+        topside_timed_out = bool(msg.kill_switches_timed_out & id_mask)
+        topside_asserting_kill = bool(msg.kill_switches_asserting_kill & id_mask)
 
-        # self.get_logger().info(f'killed index {indexB} assert: {assertB}, timeout: {timeoutB}, killed:{isAsserted}, timedout:{isTimeout}')
+        globalKillMismatch = requestedAssertingKill and not globalKillAsserting
 
-        return isAsserted > 0 or isTimeout  > 0
+        return topside_enabled and (topside_asserting_kill == requestedAssertingKill) and (not topside_timed_out) and (not globalKillMismatch)
 
 
 def main(args=None):
-    rclpy.init(args=args)
+    gpioController = GPIOController()
 
-    physical_kill_switch_node = PhysicalKillSwitch()
+    try:
+        rclpy.init(args=args)
 
-    rclpy.spin(physical_kill_switch_node)
-
-    # Shut down GPIO access
-    physical_kill_switch_node.releaseGpio()
-
-    rclpy.shutdown()
+        physical_kill_switch_node = TopsideKillSwitch(gpioController)
+        rclpy.spin(physical_kill_switch_node)
+        rclpy.shutdown()
+    finally:
+        gpioController.releaseGpio()
 
 
 if __name__ == '__main__':
