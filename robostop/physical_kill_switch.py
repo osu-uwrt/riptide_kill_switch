@@ -6,7 +6,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, qos_profile_system_default
 
 from std_msgs.msg import Bool
-from riptide_msgs2.msg import KillSwitchReport, FirmwareStatus
+from riptide_msgs2.msg import DshotPartialTelemetry, FirmwareStatus, KillSwitchReport
 
 from riptide_hardware2.common import ExpiringMessage, Mk2Board
 
@@ -332,8 +332,7 @@ class TopsideKillSwitch(Node):
 
         self.create_subscription(FirmwareStatus, 'state/firmware', self.firmware_state_callback, qos_profile_sensor_data)
         self.create_subscription(Bool, 'state/kill', self.kill_state_callback, qos_profile_sensor_data)
-        self.create_subscription(Bool, 'state/thrusters/moving_brd0', self.moving_brd0_callback, qos_profile_sensor_data)
-        self.create_subscription(Bool, 'state/thrusters/moving_brd1', self.moving_brd1_callback, qos_profile_sensor_data)
+        self.create_subscription(DshotPartialTelemetry, 'state/thrusters/telemetry', self.thruster_telemetry_callback, qos_profile_sensor_data)
         self.reportPublisher = self.create_publisher(KillSwitchReport, 'command/software_kill', qos_profile_system_default)
 
         self.refreshTimer = self.create_timer(0.15, self.refreshCallback)
@@ -356,11 +355,11 @@ class TopsideKillSwitch(Node):
 
         self.firmwareStatus.update_value(msg)
 
-    def moving_brd0_callback(self, msg: Bool):
-        self.movingBrd0Message.update_value(msg.data)
-
-    def moving_brd1_callback(self, msg: Bool):
-        self.movingBrd1Message.update_value(msg.data)
+    def thruster_telemetry_callback(self, msg: DshotPartialTelemetry):
+        if msg.start_thruster_num == 0:
+            self.movingBrd0Message.update_value(msg.thrusters_moving)
+        else:
+            self.movingBrd1Message.update_value(msg.thrusters_moving)
 
     def kill_state_callback(self, msg: Bool):
         self.globalKillMessage.update_value(msg.data)
